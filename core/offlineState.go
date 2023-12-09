@@ -35,7 +35,7 @@ func appendOfflineToVariantPlaylist(index int, playlistFilePath string) {
 	// Manually append the offline clip to the end of the media playlist.
 	_, _ = atomicWriteTmpPlaylistFile.WriteString("#EXT-X-DISCONTINUITY\n")
 	// If "offline" content gets changed then change the duration below
-	_, _ = atomicWriteTmpPlaylistFile.WriteString("#EXTINF:8.000000,\n")
+	_, _ = atomicWriteTmpPlaylistFile.WriteString("#EXTINF:15.000000,\n")
 	_, _ = atomicWriteTmpPlaylistFile.WriteString("offline.ts\n")
 	// _, _ = atomicWriteTmpPlaylistFile.WriteString("#EXT-X-ENDLIST\n")
 
@@ -64,7 +64,7 @@ func makeVariantIndexOffline(streamId string, index int, offlineFilePath string,
 	if utils.DoesFileExists(playlistFilePath) {
 		appendOfflineToVariantPlaylist(index, playlistFilePath)
 	} else {
-		createEmptyOfflinePlaylist(playlistFilePath, offlineFilename)
+		// createEmptyOfflinePlaylist(playlistFilePath, offlineFilename)
 	}
 	if _, err := _storage.Save(playlistFilePath, playlistFilePath, 0); err != nil {
 		log.Warnln(err)

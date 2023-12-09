@@ -144,7 +144,7 @@ func (s *S3Storage) VariantPlaylistWritten(localFilePath string) {
 			log.Errorln(err)
 			s.queuedPlaylistUpdates[localFilePath] = localFilePath
 		}
-		delete(s.queuedPlaylistUpdates, localFilePath)
+		// delete(s.queuedPlaylistUpdates, localFilePath)
 	}
 }
 
@@ -220,14 +220,18 @@ func (s *S3Storage) Save(localFilePath, remoteDestinationPath string, retryCount
 			return s.Save(localFilePath, remoteDestinationPath, retryCount+1)
 		}
 
-		// Upload failure. Remove the local file.
-		s.removeLocalFile(localFilePath)
+		if !strings.Contains(localFilePath, "stream.m3u8") {
+			// Upload failure. Remove the local file.
+			s.removeLocalFile(localFilePath)
+		}
 
 		return "", fmt.Errorf("giving up uploading %s to object storage %s", localFilePath, s.s3Endpoint)
 	}
 
 	// Upload success. Remove the local file.
-	s.removeLocalFile(localFilePath)
+	if !strings.Contains(localFilePath, "stream.m3u8") {
+		s.removeLocalFile(localFilePath)
+	}
 
 	return remotePathRelative, nil
 }
