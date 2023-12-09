@@ -37,7 +37,7 @@ func appendOfflineToVariantPlaylist(index int, playlistFilePath string) {
 	// If "offline" content gets changed then change the duration below
 	_, _ = atomicWriteTmpPlaylistFile.WriteString("#EXTINF:8.000000,\n")
 	_, _ = atomicWriteTmpPlaylistFile.WriteString("offline.ts\n")
-	_, _ = atomicWriteTmpPlaylistFile.WriteString("#EXT-X-ENDLIST\n")
+	// _, _ = atomicWriteTmpPlaylistFile.WriteString("#EXT-X-ENDLIST\n")
 
 	if err := atomicWriteTmpPlaylistFile.Close(); err != nil {
 		log.Errorln(err)
