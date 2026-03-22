@@ -51,7 +51,8 @@ func NewRecording(streamID string) *HLSRecorder {
 		StartTime:   sql.NullTime{Time: h.startTime, Valid: true},
 		StreamTitle: sql.NullString{String: streamTitle, Valid: validTitle},
 	}); err != nil {
-		log.Panicln(err)
+		log.Errorln("Failed to insert stream record for replay:", err)
+		return nil
 	}
 
 	// Create a reference of the output configurations that were used for this stream.
@@ -70,7 +71,7 @@ func NewRecording(streamID string) *HLSRecorder {
 			ResolutionHeight: sql.NullInt32{Int32: int32(o.ScaledHeight), Valid: true},
 			Timestamp:        sql.NullTime{Time: time.Now(), Valid: true},
 		}); err != nil {
-			log.Panicln(err)
+			log.Errorln("Failed to insert output configuration for replay:", err)
 		}
 
 		h.outputConfigurations = append(h.outputConfigurations, HLSOutputConfiguration{
