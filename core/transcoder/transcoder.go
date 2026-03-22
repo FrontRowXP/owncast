@@ -132,12 +132,19 @@ func (t *Transcoder) Start(shouldLog bool) {
 
 	stdout, err := _commandExec.StderrPipe()
 	if err != nil {
-		log.Fatalln(err)
+		log.Errorln("Failed to create stderr pipe for transcoder:", err)
+		if t.TranscoderCompleted != nil {
+			t.TranscoderCompleted(err)
+		}
+		return
 	}
 
 	if err := _commandExec.Start(); err != nil {
-		log.Errorln("Transcoder error. See", logging.GetTranscoderLogFilePath(), "for full output to debug.")
-		log.Panicln(err, command)
+		log.Errorln("Transcoder error. See", logging.GetTranscoderLogFilePath(), "for full output to debug.", err, command)
+		if t.TranscoderCompleted != nil {
+			t.TranscoderCompleted(err)
+		}
+		return
 	}
 
 	go func() {

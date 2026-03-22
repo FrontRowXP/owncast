@@ -103,14 +103,14 @@ func createVariantDirectories(streamID string) {
 	if len(data.GetStreamOutputVariants()) != 0 {
 		for index := range data.GetStreamOutputVariants() {
 			if err := os.MkdirAll(path.Join(config.HLSStoragePath, streamID, strconv.Itoa(index)), 0o750); err != nil {
-				log.Fatalln(err)
+				log.Errorln("Failed to create variant directory:", err)
 			}
 		}
 	} else {
 		dir := path.Join(config.HLSStoragePath, strconv.Itoa(0))
 		log.Traceln("Creating", dir)
 		if err := os.MkdirAll(dir, 0o750); err != nil {
-			log.Fatalln(err)
+			log.Errorln("Failed to create variant directory:", err)
 		}
 	}
 }
