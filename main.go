@@ -3,7 +3,9 @@ package main
 import (
 	"flag"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"github.com/owncast/owncast/logging"
 	log "github.com/sirupsen/logrus"
@@ -108,9 +110,26 @@ func main() {
 
 	go metrics.Start(core.GetStatus)
 
+	go handleShutdown()
+
 	if err := router.Start(); err != nil {
 		log.Fatalln("failed to start/run the router", err)
 	}
+}
+
+func handleShutdown() {
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+
+	<-sig
+	log.Infoln("Shutdown signal received. Cleaning up stream state...")
+
+	if core.GetStatus().Online {
+		core.SetStreamAsDisconnected()
+	}
+
+	log.Infoln("Shutdown cleanup complete. Exiting.")
+	os.Exit(0)
 }
 
 func handleCommandLineFlags() {
