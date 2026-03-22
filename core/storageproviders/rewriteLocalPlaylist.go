@@ -2,6 +2,7 @@ package storageproviders
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 
@@ -16,8 +17,9 @@ import (
 func rewriteRemotePlaylist(localFilePath, remoteServingEndpoint, pathPrefix string) error {
 	f, err := os.Open(localFilePath) // nolint
 	if err != nil {
-		log.Fatalln(err)
+		return fmt.Errorf("unable to open playlist file %s: %w", localFilePath, err)
 	}
+	defer f.Close()
 
 	p := m3u8.NewMasterPlaylist()
 	if err := p.DecodeFrom(bufio.NewReader(f), false); err != nil {
@@ -38,18 +40,19 @@ func rewriteRemotePlaylist(localFilePath, remoteServingEndpoint, pathPrefix stri
 // rewriteLocalPlaylist will take a local master playlist and rewrite it to
 // refer to the path that includes the stream ID.
 func rewriteLocalPlaylist(localFilePath, streamID, destinationPath string) error {
+	if streamID == "" {
+		return fmt.Errorf("stream id must be set when rewriting playlist contents")
+	}
+
 	f, err := os.Open(localFilePath) // nolint
 	if err != nil {
-		log.Fatalln(err)
+		return fmt.Errorf("unable to open playlist file %s: %w", localFilePath, err)
 	}
+	defer f.Close()
 
 	p := m3u8.NewMasterPlaylist()
 	if err := p.DecodeFrom(bufio.NewReader(f), false); err != nil {
 		log.Warnln(err)
-	}
-
-	if streamID == "" {
-		log.Fatalln("stream id must be set when rewriting playlist contents")
 	}
 
 	for _, item := range p.Variants {

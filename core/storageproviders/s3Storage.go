@@ -143,8 +143,9 @@ func (s *S3Storage) VariantPlaylistWritten(localFilePath string) {
 		if _, err := s.Save(localFilePath, remoteDestinationPath, 0); err != nil {
 			log.Errorln(err)
 			s.queuedPlaylistUpdates[localFilePath] = localFilePath
+		} else {
+			delete(s.queuedPlaylistUpdates, localFilePath)
 		}
-		// delete(s.queuedPlaylistUpdates, localFilePath)
 	}
 }
 
