@@ -1,5 +1,95 @@
 # Incident Report: Livestream Production Outage — Mar 21 Root Cause Analysis
 
+## 0. What Happened (Plain English)
+
+### The Analogy
+
+Imagine a restaurant (our livestream platform) with a kitchen (the database) that can serve a maximum of **5,000 plates at once**. Each waiter (a server pod) needs about **150 plates** to serve their tables.
+
+Before the incident, we had a rule: "if the restaurant gets busy, hire up to 40 waiters automatically." Someone calculated that 40 waiters would only need 800 plates (40 × 20) — but they used the number from our **practice kitchen** (dev environment), where each waiter only handles 20 plates. In the **real kitchen** (production), each waiter handles **150 plates**.
+
+On March 21, the restaurant got busy. The system automatically hired more waiters until we had ~40. They tried to use 6,000 plates — but the kitchen only has 5,000. The kitchen locked up. No food could come out. The livestream section of the restaurant went dark.
+
+### Key Terms Explained
+
+**HPA (Horizontal Pod Autoscaler)** — This is a Kubernetes feature that automatically adds or removes copies of a service (called "pods") based on how busy they are. Think of it like a staffing manager that hires more workers when traffic increases and sends them home when it's quiet. "Horizontal" means it adds more identical copies (vs. "vertical" which would make one copy bigger). When we say `maxReplicas=40`, we mean "never hire more than 40 copies of this service."
+
+**Pod** — A pod is a single running copy of a service. If `channel-api` has 10 pods, that means 10 identical copies of the channel-api program are running simultaneously, sharing the incoming work. Kubernetes distributes traffic across all pods.
+
+**RDS (Relational Database Service)** — This is **not** "Real-Time Delivery Service." RDS is Amazon's managed database service (Amazon RDS). It runs our PostgreSQL database in the cloud. Amazon manages the hardware, backups, and maintenance. The database stores everything — user data, channel info, livestream state, chat messages, etc. RDS has a hard limit on how many simultaneous connections it allows (`max_connections = 5,000`).
+
+**Database Connection** — Every time a service needs to read or write data, it opens a "connection" to the database — like a phone line. Opening a new connection is slow, so services keep a **pool** of connections ready (a "connection pool"). Each pod keeps ~150 connections open and ready at all times, even if they're not all being used at that exact moment.
+
+**pgxpool / Connection Pool** — A pool of pre-opened database connections that a pod keeps ready. Instead of dialing the database every time, the pod grabs an available connection from the pool, uses it, and returns it. Our pods use 4 pools × 50 connections each = ~150-200 connections per pod.
+
+**NATS** — A messaging system that lets our services talk to each other in real time. When one service needs to tell another service "hey, a viewer just joined channel X," it sends a message through NATS. Think of it like an internal Slack for our servers.
+
+**CAS (Compare-And-Swap)** — A safe way for multiple processes to update the same data without overwriting each other. Without CAS, if two pods try to update a list at the same time, one pod's changes get silently lost (last write wins). With CAS, the second write says "wait, the data changed since I read it — let me re-read and try again."
+
+### What Exactly Broke and Why
+
+**Step 1 — The Config Mistake (PR #5173, Mar 18)**
+
+Someone changed the autoscaler config for `channel-api` to allow up to 40 pods. Their math:
+
+```
+"45 pods × 20 connections/pod = 900 connections — well under 5,000, safe!"
+```
+
+The problem: **20 connections/pod is the dev environment number.** In production, each pod uses **150 connections** (4 connection pools × ~38-50 connections each). The correct math:
+
+```
+40 pods × 150 connections/pod = 6,000 connections
+RDS limit                     = 5,000 connections
+Overshoot                     = 1,000 connections over the limit
+```
+
+**Step 2 — Traffic Spike Triggers Scaling (Mar 21)**
+
+On March 21, viewer traffic increased. The HPA saw CPU/memory usage climbing and started spinning up more `channel-api` pods. This is exactly what it's designed to do — handle more load by adding more workers.
+
+**Step 3 — Database Connection Exhaustion**
+
+As pods scaled past ~33 (33 × 150 = 4,950 ≈ the limit), new connection attempts started failing. The database said "I have no more capacity — go away." This affected **all services** sharing that database, not just `channel-api`.
+
+**Step 4 — Retry Storms**
+
+When a database query fails, the application typically retries it. But the retry also needs a connection — which also fails. Thousands of retries across dozens of pods created a "retry storm" — massive amplification of the original problem.
+
+**Step 5 — NATS Saturation**
+
+The retry storms generated a flood of new NATS subscriptions (each retry attempt creates messaging overhead). NATS memory climbed toward its 4 GB limit, degrading inter-service communication.
+
+**Step 6 — Livestream Services Collapse**
+
+The livestream services (Owncast pods) depend on the database to track which streams are active. With DB connections exhausted:
+- The `livestream_servers` table couldn't be read or written
+- The manager service couldn't detect or recover active streams
+- Active livestreams disappeared from the table
+- The creator's stream went down
+
+**Step 7 — Race Condition Made Recovery Harder**
+
+A separate bug in the NATS connection tracking code (`RegisterConnection` / `RemoveConnection`) meant that when multiple pods tried to update the "who's connected to what channel" list simultaneously, they overwrote each other's data. This made the system's view of active connections unreliable even as things started recovering.
+
+### Are Our Connection Numbers Normal?
+
+**150 connections per pod is on the high side but not abnormal** for a service handling real-time features (live chat, viewer tracking, stream state). The issue isn't the per-pod count itself — it's that nobody accounted for it when setting the autoscaler limit.
+
+The deeper issue: there's no safety net between the application and the database. If services scale up, nothing prevents them from collectively exceeding the database's capacity. The long-term fix is to put a **connection proxy** (PgBouncer or RDS Proxy) in front of the database that enforces a hard limit — like a bouncer at the kitchen door who says "only 5,000 plates out at a time, no matter how many waiters ask."
+
+### How PR #5236 Fixes It
+
+| What Changed | Why |
+|-------------|-----|
+| HPA `maxReplicas` reduced across 6 services | Worst-case pod count can no longer exceed the DB connection budget |
+| RDS CloudWatch alarm: 10 min → 3 min | Detects connection spikes 3× faster |
+| NATS memory alert at 3.5 Gi (87.5%) | Warns before NATS hits its 4 Gi limit |
+| NATS KV race condition fixed (CAS writes) | Pods no longer silently overwrite each other's connection data |
+| `createPgxPool` default MaxConns: 350 → 50 | Prevents future services from accidentally grabbing too many connections |
+
+---
+
 ## 1. Incident Timeline
 
 | Time | Event |
