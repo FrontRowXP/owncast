@@ -206,7 +206,7 @@ func (q *Queries) DoesInboundActivityExist(ctx context.Context, arg DoesInboundA
 }
 
 const fixUnfinishedStreams = `-- name: FixUnfinishedStreams :exec
-UPDATE streams SET end_time = (SELECT timestamp FROM video_segments WHERE stream_id = streams.id) WHERE end_time IS NULL
+UPDATE streams SET end_time = (SELECT timestamp FROM video_segments WHERE stream_id = streams.id ORDER BY timestamp DESC LIMIT 1) WHERE end_time IS NULL
 `
 
 func (q *Queries) FixUnfinishedStreams(ctx context.Context) error {

@@ -61,7 +61,8 @@ func setStreamAsConnected(rtmpOut *io.PipeReader) {
 	}
 
 	if err := setupStorage(); err != nil {
-		log.Fatalln("failed to setup the storage", err)
+		log.Errorln("failed to setup the storage", err)
+		return
 	}
 
 	setupVideoComponentsForId(streamId)
@@ -92,20 +93,29 @@ func SetStreamAsDisconnected() {
 	_stats.LastConnectTime = nil
 	_broadcaster = nil
 
-	offlineFilename := "offline.ts"
-
-	offlineFilePath, err := saveOfflineClipToDisk(offlineFilename)
-	if err != nil {
-		log.Errorln(err)
-		return
-	}
-
 	handler.StreamEnded()
 	transcoder.StopThumbnailGenerator()
 	rtmp.Disconnect()
 
 	if _yp != nil {
 		_yp.Stop()
+	}
+
+	// Always send the stream stopped webhook so the external manager stays in sync,
+	// even if subsequent offline-transition steps fail.
+	if _currentBroadcast != nil {
+		go webhooks.SendStreamStatusEvent(models.StreamStopped, _currentBroadcast.StreamID)
+	}
+
+	offlineFilename := "offline.ts"
+
+	offlineFilePath, err := saveOfflineClipToDisk(offlineFilename)
+	if err != nil {
+		log.Errorln("failed to save offline clip to disk:", err)
+		stopOnlineCleanupTimer()
+		transitionToOfflineVideoStreamContent()
+		saveStats()
+		return
 	}
 
 	// If there is no current broadcast available the previous stream
@@ -125,8 +135,6 @@ func SetStreamAsDisconnected() {
 	StartOfflineCleanupTimer()
 	stopOnlineCleanupTimer()
 	saveStats()
-
-	go webhooks.SendStreamStatusEvent(models.StreamStopped, _currentBroadcast.StreamID)
 }
 
 // StartOfflineCleanupTimer will fire a cleanup after n minutes being disconnected.

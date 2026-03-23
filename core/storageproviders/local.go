@@ -1,6 +1,7 @@
 package storageproviders
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,7 +37,7 @@ func (s *LocalStorage) Setup() error {
 // SegmentWritten is called when a single segment of video is written.
 func (s *LocalStorage) SegmentWritten(localFilePath string) (string, int, error) {
 	if s.streamID == "" {
-		log.Fatalln("stream id must be set when handling video segments")
+		return "", 0, fmt.Errorf("stream id must be set when handling video segments")
 	}
 
 	destinationPath, err := s.Save(localFilePath, localFilePath, 0)
@@ -51,7 +52,8 @@ func (s *LocalStorage) SegmentWritten(localFilePath string) (string, int, error)
 // VariantPlaylistWritten is called when a variant hls playlist is written.
 func (s *LocalStorage) VariantPlaylistWritten(localFilePath string) {
 	if s.streamID == "" {
-		log.Fatalln("stream id must be set when handling video playlists")
+		log.Errorln("stream id must be set when handling video playlists")
+		return
 	}
 
 	if _, err := s.Save(localFilePath, localFilePath, 0); err != nil {
@@ -63,7 +65,8 @@ func (s *LocalStorage) VariantPlaylistWritten(localFilePath string) {
 // MasterPlaylistWritten is called when the master hls playlist is written.
 func (s *LocalStorage) MasterPlaylistWritten(localFilePath string) {
 	if s.streamID == "" {
-		log.Fatalln("stream id must be set when handling video playlists")
+		log.Errorln("stream id must be set when handling video playlists")
+		return
 	}
 
 	masterPlaylistDestinationLocation := filepath.Join(config.HLSStoragePath, "/stream.m3u8")

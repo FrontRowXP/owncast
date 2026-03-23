@@ -50,10 +50,10 @@ func appendOfflineToVariantPlaylist(index int, playlistFilePath string) {
 
 func makeVariantIndexOffline(streamId string, index int, offlineFilePath string, offlineFilename string) {
 	playlistFilePath := fmt.Sprintf(filepath.Join(config.HLSStoragePath, streamId, "%d/stream.m3u8"), index)
-	// segmentFilePath := fmt.Sprintf(filepath.Join(config.HLSStoragePath, streamId, "%d/%s"), index, offlineFilename)
+	segmentFilePath := fmt.Sprintf(filepath.Join(config.HLSStoragePath, streamId, "%d/%s"), index, offlineFilename)
 	segmentFileDestinationPath := fmt.Sprintf(filepath.Join("hls", streamId, "%d/%s"), index, offlineFilename)
 
-	if err := utils.Copy(offlineFilePath, offlineFilePath); err != nil {
+	if err := utils.Copy(offlineFilePath, segmentFilePath); err != nil {
 		log.Warnln(err)
 	}
 
@@ -97,11 +97,11 @@ func saveOfflineClipToDisk(offlineFilename string) (string, error) {
 	offlineFileData := static.GetOfflineSegment()
 	offlineTmpFile, err := os.CreateTemp(config.TempDir, offlineFilename)
 	if err != nil {
-		log.Errorln("unable to create temp file for offline video segment", err)
+		return "", fmt.Errorf("unable to create temp file for offline video segment: %w", err)
 	}
 
 	if _, err = offlineTmpFile.Write(offlineFileData); err != nil {
-		return "", fmt.Errorf("unable to write offline segment to disk: %s", err)
+		return "", fmt.Errorf("unable to write offline segment to disk: %w", err)
 	}
 
 	offlineFilePath := offlineTmpFile.Name()
