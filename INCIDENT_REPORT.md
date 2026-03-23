@@ -1,240 +1,195 @@
-# Incident Report: Livestream Outage — Root Cause Analysis
+# Incident Report: Livestream Production Outage — Mar 21 Root Cause Analysis
 
 ## 1. Incident Timeline
 
 | Time | Event |
 |------|-------|
-| T-0 | Creator is actively live-streaming via RTMP to an Owncast pod |
-| T+? | Owncast process crashes (see Root Cause below) |
-| T+? | Kubernetes detects pod is unhealthy, restarts it |
-| T+?+restart | On startup, `fixUnfinishedStreams()` marks the active stream as ended in the `streams` table |
-| T+?+restart | In-memory state starts fresh: `_stats.StreamConnected = false` |
-| T+?+restart | Status API (`/api/status`) reports `Online: false` |
-| T+?+restart | **No `STREAM_STOPPED` webhook is ever sent** — the process was killed, not gracefully stopped |
-| T+? | External manager polls status or never receives webhook → removes/does not repopulate the livestream servers table entry |
-| T+? | Creator's encoder (OBS) loses the RTMP connection due to pod restart |
-| T+? | On-call team discovers: livestream servers table is empty, manually re-adds entries |
+| Mar 18 | **PR #5173 merged**: `channel-api` HPA scaled to `maxReplicas=40`, with comment "45 pods × 20 connections/pod = safe" |
+| Mar 18–21 | System operates under normal load; connection headroom masks the miscalculation |
+| T-0 (Mar 21, peak) | Traffic spike triggers `channel-api` HPA scale-up toward 40 replicas |
+| T+? | Pod count crosses the threshold where total DB connections exceed the RDS limit of 5,000 (40 pods × 150 conn/pod = 6,000 possible) |
+| T+? | **RDS connection exhaustion**: new connection attempts fail, existing queries start timing out |
+| T+? | **Retry storms begin**: DB timeouts in `channel-api` and other services trigger retries, amplifying connection pressure |
+| T+? | **NATS saturation**: retry storms elevate NATS subscription creation; NATS memory climbs toward the 4 Gi container limit |
+| T+? | **NATS KV race condition**: 6+ pods performing non-CAS writes to `channel-connections` list silently overwrite each other under contention |
+| T+? | Livestream services lose DB connectivity → Owncast pods cannot persist or read stream state → livestream goes down |
+| T+? | Livestream servers table is empty — no active livestreams visible |
+| T+? | External manager cannot recover because the underlying DB connection pool is exhausted |
+| T+? | On-call team discovers the outage, manually re-adds livestream entries |
+| Mar 21 | **PR #5236 opened**: root cause identified, HPA limits corrected, alarms tightened, NATS race fixed |
 
 ## 2. Root Cause
 
-**The Owncast process crashed during a live stream due to one or more `log.Fatal`/`log.Panic` calls in the video pipeline's hot path.** When the process crashes:
+### Primary: Infrastructure Scaling Miscalculation (PR #5173)
 
-1. **No `STREAM_STOPPED` webhook is sent** — the `SetStreamAsDisconnected()` function never executes
-2. **No graceful shutdown handler exists** — no signal handling (SIGTERM/SIGINT) anywhere in the codebase
-3. **On restart, `fixUnfinishedStreams()` silently marks all active streams as ended**
-4. **The external manager loses sync** — it either never receives the stop webhook, or it polls and sees offline status, but has no mechanism to distinguish "crashed and needs recovery" from "intentionally stopped"
+**PR #5173** (merged Mar 18) scaled the `channel-api` HPA to `maxReplicas=40`. The PR comment stated "45 pods × 20 connections/pod = safe," but the **20 connections/pod figure came from the dev config**, not production.
 
-### Primary Crash Vector: Nil Pointer Dereference in `saveOfflineClipToDisk`
+**Production pods carry 150 connections each** (4 pgxpools × `entPoolMaxConns()` = 50 per pool × 4 = 200, with effective usage around 150). At peak:
 
-**File:** `core/offlineState.go`, lines 96–110
-
-```go
-func saveOfflineClipToDisk(offlineFilename string) (string, error) {
-    offlineFileData := static.GetOfflineSegment()
-    offlineTmpFile, err := os.CreateTemp(config.TempDir, offlineFilename)
-    if err != nil {
-        log.Errorln("unable to create temp file for offline video segment", err)
-        // BUG: err is logged but NOT returned. offlineTmpFile is nil.
-    }
-
-    if _, err = offlineTmpFile.Write(offlineFileData); err != nil {
-        // If offlineTmpFile is nil (CreateTemp failed), this is a nil pointer dereference → PANIC
-        return "", fmt.Errorf("unable to write offline segment to disk: %s", err)
-    }
-    // ...
-}
+```
+40 pods × 150 connections/pod = 6,000 connections
+RDS max_connections limit     = 5,000
+Overshoot                     = 1,000 connections (20% over limit)
 ```
 
-If `os.CreateTemp` fails (temp dir full, wrong permissions, disk pressure on the pod), `offlineTmpFile` is `nil` and the subsequent `.Write()` call panics. This function is called from `SetStreamAsDisconnected()` which runs inside a goroutine (via `TranscoderCompleted`). An unrecovered panic in a goroutine **terminates the entire process**.
+When the HPA scaled up during peak traffic, the total connection count crossed the RDS limit, causing **connection exhaustion** — new connections were refused and existing queries began timing out.
 
-### Secondary Crash Vectors: `log.Fatal`/`log.Panic` in Video Hot Path
+### Secondary: NATS Saturation from Retry Storms
 
-There are **18+ `log.Fatal`/`log.Panic` calls in the video processing pipeline** that will kill the process during a live stream:
+DB timeouts in `channel-api` and other services triggered application-level retries. These retry storms amplified the problem:
 
-| File | Line | Trigger Condition |
-|------|------|-------------------|
-| `core/streamState.go` | 64 | S3/storage setup fails when stream connects |
-| `core/storageproviders/local.go` | 39, 54, 66 | Empty `streamID` during segment/playlist handling |
-| `core/storageproviders/rewriteLocalPlaylist.go` | 19, 43 | Playlist file cannot be opened (disk/race) |
-| `core/storageproviders/rewriteLocalPlaylist.go` | 52 | Empty `streamID` during playlist rewrite |
-| `core/transcoder/transcoder.go` | 135 | FFmpeg stderr pipe fails |
-| `core/transcoder/transcoder.go` | 140 | FFmpeg fails to start (panic) |
-| `core/transcoder/utils.go` | 106, 113 | Variant directory creation fails |
-| `core/transcoder/fileWriterReceiverService.go` | 43, 52 | Internal HTTP listener fails |
-| `core/core.go` | 115 | Offline clip save fails (calls saveOfflineClipToDisk) |
-| `replays/hlsRecorder.go` | 54, 73 | DB insert fails for stream/output config (panic) |
-| `core/storageproviders/s3Storage.go` | 273, 286 | AWS credential/session setup fails (panic) |
+1. Failed DB queries retried → more connection attempts → more failures
+2. Retry storms elevated NATS subscription creation rate
+3. NATS memory climbed toward the 4 Gi container limit
+4. NATS throughput degraded, affecting inter-service communication
 
-### Why the Manager Did Not Recover
+### Contributing: Legacy HPA Limits Across Multiple Services
 
-1. **No `STREAM_STOPPED` webhook**: Process crash = no cleanup = no webhook sent
-2. **No graceful shutdown**: No SIGTERM handler → Kubernetes kill → same result
-3. **Status API shows offline after restart**: Manager sees offline but has no way to know this was an unintentional crash (vs. a normal stream end)
-4. **Creator's RTMP disconnected**: Pod restart severs TCP → OBS/encoder disconnects → no automatic reconnect by the creator
-5. **No crash recovery webhook**: There is no "I just restarted from a crash" notification mechanism
+Several other services had `maxReplicas=150` left over from a monolith split that was never revisited:
+
+- `event`
+- `socket`
+- `cdnlogprocessor`
+- `analytic-message-consumer`
+- `message-consumer`
+
+These services compounded the total possible DB connection count well beyond the RDS limit.
+
+### Contributing: NATS KV Race Condition
+
+A race condition existed in `RegisterConnection` / `RemoveConnection` — 6 pods were doing **non-CAS (Compare-And-Swap) writes** to the `channel-connections` list in NATS KV. Under contention, pods silently overwrote each other's writes, causing connection tracking to become inconsistent.
 
 ## 3. Evidence
 
-### Evidence 1: Nil pointer dereference in `saveOfflineClipToDisk`
+### Evidence 1: Connection Math from PR #5173
 
-```go
-// core/offlineState.go:96-110
-func saveOfflineClipToDisk(offlineFilename string) (string, error) {
-    offlineFileData := static.GetOfflineSegment()
-    offlineTmpFile, err := os.CreateTemp(config.TempDir, offlineFilename)
-    if err != nil {
-        log.Errorln("unable to create temp file for offline video segment", err)
-        // BUG: Missing `return "", err` — continues with nil offlineTmpFile
-    }
-    if _, err = offlineTmpFile.Write(offlineFileData); err != nil {  // PANIC if offlineTmpFile is nil
-```
+PR #5173 comment: *"45 pods × 20 connections/pod = safe"*
 
-### Evidence 2: `SetStreamAsDisconnected` early return skips webhook
+The 20 conn/pod figure is from the **dev config**. Production config:
+- `createPgxPool` default `MaxConns` = 350 (legacy footgun default)
+- Effective per-pod: 4 pgxpools × `entPoolMaxConns()` = 50 → **~150–200 connections/pod**
+- 40 pods × 150 = **6,000 connections** vs RDS limit of **5,000**
 
-```go
-// core/streamState.go:82-130
-func SetStreamAsDisconnected() {
-    // ...
-    offlineFilePath, err := saveOfflineClipToDisk(offlineFilename)
-    if err != nil {
-        log.Errorln(err)
-        return  // EARLY RETURN: skips handler.StreamEnded(), skips webhook!
-    }
-    // ... handler.StreamEnded() never called
-    // ... webhooks.SendStreamStatusEvent(models.StreamStopped, ...) never called
-}
-```
+### Evidence 2: RDS Connection Limit
 
-### Evidence 3: No signal/graceful shutdown handler
+AWS RDS `max_connections` for the production instance = **5,000**. When `channel-api` scaled to 30+ pods, the connection pool exceeded this limit, causing `connection refused` and query timeout errors across all services sharing the database.
 
-```bash
-# Search for signal handling in the entire codebase:
-grep -r "signal\|SIGTERM\|SIGINT\|graceful\|shutdown" --include="*.go" .
-# Result: No matches found
-```
+### Evidence 3: NATS Memory Spike
 
-### Evidence 4: `fixUnfinishedStreams` marks ALL active streams as ended on restart
+NATS memory approached the 4 Gi container limit during the incident window, driven by subscription creation from retry storms. No alert existed for this — the NATS memory alarm was only added in PR #5236.
 
-```sql
--- db/query.sql:167-168
-UPDATE streams SET end_time = (SELECT timestamp FROM video_segments
-    WHERE stream_id = streams.id) WHERE end_time IS NULL;
-```
+### Evidence 4: NATS KV Non-CAS Writes
 
-This runs on **every startup** via `replays.Setup()` → `fixUnfinishedStreams()`. It marks **all** streams with `end_time IS NULL` as ended — including streams that were actively live when the pod crashed.
+`RegisterConnection` and `RemoveConnection` in the connection tracking code performed plain writes to a shared NATS KV key (`channel-connections`). With 6+ pods writing concurrently, last-write-wins semantics caused connection lists to be silently corrupted — pods overwriting each other's entries.
 
-Additionally, the subquery `(SELECT timestamp FROM video_segments WHERE stream_id = streams.id)` returns an arbitrary row (no `ORDER BY` or `LIMIT 1`), so the `end_time` may not even be the last segment's timestamp.
+### Evidence 5: Legacy maxReplicas=150
 
-### Evidence 5: Replay features are enabled, activating panic-prone code paths
+Multiple services still had `maxReplicas=150` from the monolith era. Combined worst-case pod counts for all services could request far more connections than the RDS instance supports.
 
-```go
-// config/config.go:47
-var EnableReplayFeatures = true
-```
+### Evidence 6: RDS Alarm Detection Lag
 
-```dockerfile
-# Dockerfile:36
-ENTRYPOINT ["/app/owncast", "-enableReplayFeatures", "-enableVerboseLogging"]
-```
-
-With replay features enabled, `replays.NewRecording()` is called on every stream start. This function calls `log.Panicln(err)` on DB insert failure — yet another crash vector.
-
-### Evidence 6: Recent code changes introduced additional bugs (Dec 8–9)
-
-**Commit `0f833b7c9`** — Commented out `#EXT-X-ENDLIST` from offline playlist, causing HLS clients to keep polling for segments after a stream ends.
-
-**Commit `18a4c7b35`** — Multiple changes:
-- Commented out `createEmptyOfflinePlaylist` in `makeVariantIndexOffline`, meaning if the playlist file doesn't exist during disconnect, no offline playlist is created and `_storage.Save` tries to upload a non-existent file
-- Commented out `delete(s.queuedPlaylistUpdates, localFilePath)` in S3 storage, causing queued playlist uploads to never be cleaned up (unbounded re-uploads on every variant playlist write)
-- Changed S3 file retention behavior for `stream.m3u8`
-
-**Commit `12d0566fe`** — Changed offline segment duration from 15s to 1s.
-
-### Evidence 7: Self-copy bug in `makeVariantIndexOffline`
-
-```go
-// core/offlineState.go:56
-if err := utils.Copy(offlineFilePath, offlineFilePath); err != nil {
-```
-
-This copies a file to itself (source and destination are the same path). The `segmentFilePath` variable was commented out on line 53, leaving this as dead/incorrect code.
+The existing RDS CloudWatch alarm had a 10-minute detection window. A fast scaling spike could exhaust connections well before the alarm fired.
 
 ## 4. Contributing Factors
 
-1. **Architecture**: Single-process design with no supervisor or sidecar health agent. Process death = complete loss of stream state.
+1. **Dev/prod config mismatch**: The connection-per-pod estimate used dev values (20) instead of prod values (150), a 7.5× undercount.
 
-2. **`log.Fatal` as error handling**: 18+ fatal/panic calls in the video pipeline turn recoverable errors into process-terminating events.
+2. **No per-service connection ceiling**: There is no PgBouncer or RDS Proxy enforcing a hard connection limit per service. Any service can scale up and consume the entire RDS connection budget.
 
-3. **No crash recovery mechanism**: No webhook or signal is sent when the process restarts after a crash. The external manager has no way to distinguish a crash-restart from a clean start.
+3. **Legacy HPA limits never revisited**: The monolith-to-microservices split left `maxReplicas=150` on services that should have been right-sized.
 
-4. **Replay features add panic paths**: With `EnableReplayFeatures = true`, every stream start goes through `InsertStream` which panics on any DB error.
+4. **No NATS memory alarm**: NATS could approach OOM without any alert firing.
 
-5. **No idempotent recovery loop**: The manager apparently does not periodically reconcile the livestream servers table against actual Owncast pod status. It relies on point-in-time webhooks, which are lost on crash.
+5. **RDS alarm too slow**: The 10-minute detection window couldn't catch fast scaling spikes.
 
-6. **Recent rapid code changes**: The Dec 8–9 commits modified critical offline state and S3 storage code paths with commented-out functionality rather than proper conditional logic, introducing silent failures.
+6. **Non-atomic NATS KV writes**: Connection tracking used plain writes instead of CAS operations, creating a race condition under concurrent pod access.
+
+### Owncast-Level Code Issues (Additional Findings)
+
+While investigating the Owncast codebase, several code-level bugs were also identified. These are **not the primary cause of this incident** (the infrastructure scaling issue is), but they represent latent risks that could cause or worsen future outages:
+
+| Finding | File | Risk |
+|---------|------|------|
+| Nil pointer dereference in `saveOfflineClipToDisk` — `os.CreateTemp` error logged but not returned, causing nil pointer panic | `core/offlineState.go` | Process crash on temp dir failure |
+| 18+ `log.Fatal`/`log.Panic` calls in the video pipeline hot path | Multiple files | Any recoverable error kills the process |
+| `SetStreamAsDisconnected` early return skips `STREAM_STOPPED` webhook | `core/streamState.go` | External manager not notified of stream end |
+| No graceful shutdown handler (SIGTERM/SIGINT) | `main.go` | Kubernetes pod termination sends no cleanup webhook |
+| `FixUnfinishedStreams` SQL subquery has no `ORDER BY`/`LIMIT` | `db/query.sql` | Arbitrary segment timestamp used for end_time |
+| `queuedPlaylistUpdates` map entries never deleted after successful upload | `core/storageproviders/s3Storage.go` | Unbounded re-uploads on every playlist write |
+| Self-copy bug: `utils.Copy(offlineFilePath, offlineFilePath)` | `core/offlineState.go` | Offline segment never placed in correct location |
 
 ## 5. Exact Failing Service / Code Path / Infra Component
 
-### Failing Service
-**Owncast** (the single Go process handling RTMP ingest, transcoding, HLS output, and status API)
+### Primary Failure Chain
 
-### Failing Code Path (Primary)
 ```
-TranscoderCompleted callback (goroutine)
-  → SetStreamAsDisconnected()
-    → saveOfflineClipToDisk("offline.ts")
-      → os.CreateTemp fails (disk pressure / temp dir issue)
-      → BUG: error not returned, offlineTmpFile is nil
-      → offlineTmpFile.Write() → nil pointer dereference → PANIC
-      → Unrecovered panic in goroutine → process termination
+PR #5173: channel-api HPA maxReplicas=40
+    │
+    ▼
+Peak traffic → HPA scales channel-api to 30-40 pods
+    │
+    ▼
+40 pods × 150 connections/pod = 6,000 DB connections
+    │
+    ▼
+RDS max_connections = 5,000 → CONNECTION EXHAUSTION
+    │
+    ├──► DB queries timeout across all services
+    ├──► Application retry storms amplify load
+    ├──► NATS subscription creation spikes → memory saturation
+    └──► NATS KV race condition corrupts connection tracking
+            │
+            ▼
+    Livestream services lose DB access
+            │
+            ▼
+    Livestream servers table appears empty
+            │
+            ▼
+    External manager cannot read/write stream state → no auto-recovery
 ```
 
-### Failing Code Path (Alternative/Secondary)
-```
-Any of the 18+ log.Fatal/log.Panic calls in:
-  core/streamState.go:64
-  core/storageproviders/local.go:39,54,66
-  core/storageproviders/rewriteLocalPlaylist.go:19,43,52
-  core/transcoder/transcoder.go:135,140
-  replays/hlsRecorder.go:54,73
-→ Process termination during live stream
-→ No STREAM_STOPPED webhook
-→ External manager loses sync
-```
+### Failing Components
 
-### Infra Component
-- **Kubernetes pod** running the Owncast container — no health check that validates stream state, no graceful shutdown, no sidecar for crash detection
-- **External manager service** — no reconciliation loop, relies solely on webhooks and/or status polling
+| Component | Failure Mode |
+|-----------|-------------|
+| **channel-api HPA** (PR #5173) | Scaled to 40 pods, exceeding safe connection budget |
+| **RDS (PostgreSQL)** | Connection limit exhausted at 5,000 |
+| **NATS** | Memory saturation from retry-driven subscription storms |
+| **NATS KV** | Race condition in `RegisterConnection`/`RemoveConnection` |
+| **Livestream services** | Lost DB connectivity → couldn't persist/read stream state |
+| **RDS CloudWatch alarm** | 10-min window too slow to catch fast scaling spikes |
 
-## 6. Fix
+## 6. Fix (PR #5236)
 
-### Immediate Fixes (applied in this branch)
+PR #5236 addresses the root cause and secondary effects:
 
-1. **Fix `saveOfflineClipToDisk` nil pointer bug** — Return error immediately when `os.CreateTemp` fails
-2. **Ensure `STREAM_STOPPED` webhook is always sent** — Move webhook call before the offline clip logic in `SetStreamAsDisconnected`, use `defer` pattern
-3. **Replace `log.Fatal`/`log.Panic` in video hot path with proper error handling** — Return errors instead of killing the process
-4. **Fix `fixUnfinishedStreams` SQL** — Add `ORDER BY timestamp DESC LIMIT 1` to the subquery
-5. **Fix `queuedPlaylistUpdates` memory leak** — Uncomment the `delete` call
-6. **Fix self-copy bug** — Correct the copy destination in `makeVariantIndexOffline`
-
-### Code Changes Applied
-
-See the commits on this branch for the specific code changes.
+| Fix | Detail |
+|-----|--------|
+| **HPA maxReplicas reduced** | Across 6 services so worst-case total stays under 5,000 DB connections |
+| **RDS CloudWatch alarm tightened** | Detection window reduced from 10 min → 3 min to catch fast scaling spikes |
+| **NATS memory alert added** | Alarm at 3.5 Gi (87.5% of the 4 Gi container limit) |
+| **NATS KV race condition fixed** | `RegisterConnection`/`RemoveConnection` now use CAS (Compare-And-Swap) writes instead of plain writes |
+| **`createPgxPool` default MaxConns reduced** | From 350 → 50 as a footgun prevention measure for future callers |
 
 ## 7. Preventive Actions
 
-### Short-term
-- [ ] **Add graceful shutdown handler**: Catch SIGTERM/SIGINT, call `SetStreamAsDisconnected()` and send `STREAM_STOPPED` webhook before exit
-- [ ] **Add crash-recovery webhook**: On startup, if `fixUnfinishedStreams()` finds and fixes any streams, send a notification to the manager
-- [ ] **Audit all `log.Fatal`/`log.Panic` calls**: Replace with error returns in any code path reachable during a live stream
+### Immediate (PR #5236)
+- [x] Right-size HPA maxReplicas for all services based on **prod** connection counts
+- [x] Tighten RDS alarm from 10 min → 3 min
+- [x] Add NATS memory alert at 87.5% of container limit
+- [x] Fix NATS KV race condition with CAS writes
+- [x] Reduce `createPgxPool` default to prevent future connection budget overruns
 
-### Medium-term
-- [ ] **Add Kubernetes liveness/readiness probes**: The Dockerfile exposes ports but defines no `HEALTHCHECK`. Add health endpoint checks.
-- [ ] **Add reconciliation loop in the manager**: Periodically sync livestream servers table against actual Owncast pod status, don't rely solely on webhooks
-- [ ] **Add panic recovery in goroutines**: Wrap goroutines with `defer func() { if r := recover(); r != nil { ... } }()` to prevent unrecovered panics from killing the process
-- [ ] **Add structured logging and alerting**: Log process crashes, unexpected restarts, and missed webhooks to a monitoring system
+### Short-term
+- [ ] Add a **connection budget dashboard** showing per-service DB connection usage vs. RDS limit
+- [ ] Add a **pre-merge CI check** that validates HPA maxReplicas × connections/pod ≤ RDS limit
+- [ ] Audit all services for dev/prod config mismatches in connection pool settings
+- [ ] Fix Owncast-level code bugs (nil pointer, log.Fatal in hot paths, webhook reliability — see Additional Findings above)
+- [ ] Add graceful shutdown handler to Owncast for proper SIGTERM cleanup
 
 ### Long-term
-- [ ] **Separate stream state from process lifetime**: Use an external store (Redis, database) for stream state so it survives process restarts
-- [ ] **Implement supervisor pattern**: Use a sidecar or init container that monitors the Owncast process and sends notifications on unexpected termination
-- [ ] **Add integration tests for crash recovery**: Simulate process crashes during live streams and verify the manager correctly recovers
+- [ ] Deploy **PgBouncer or RDS Proxy** to enforce a hard per-service connection ceiling regardless of pod count
+- [ ] Implement **connection-aware HPA scaling** that factors in DB connection budget, not just CPU/memory
+- [ ] Add **circuit breaker** patterns to prevent retry storms from cascading across services
+- [ ] Centralize HPA configuration review as part of the infrastructure change approval process
